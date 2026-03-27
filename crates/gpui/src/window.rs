@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::DMABuffer;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
@@ -3694,6 +3696,26 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            image_buffer,
+        });
+    }
+
+    /// Paint a surface into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "linux")]
+    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: DMABuffer) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();

@@ -1,9 +1,10 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
+use drm_fourcc::DrmFourcc;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintSurface,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -12,6 +13,8 @@ use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+use ash::vk::{self, ExternalMemoryHandleTypeFlags};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1238,7 +1241,14 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
+                        PrimitiveBatch::Surfaces(range) => {
+                            self.draw_surfaces(
+                                &scene.surfaces[range],
+                                &mut instance_offset,
+                                &mut pass,
+                            );
+                            println!("surface!");
+
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
                             true
@@ -1382,6 +1392,130 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn get_supported_drm_modifiers(
+        &self,
+        vk_format: vk::Format,
+    ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
+
+        unsafe {
+            let device_hal = self
+                .resources()
+                .device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get a device");
+
+            let physical_device = device_hal.raw_physical_device();
+
+            let ctx = self.context.as_ref().unwrap();
+            let ctx = ctx.borrow();
+            let ctx = ctx.as_ref().unwrap();
+
+            let instance = ctx
+                .instance
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get an instance");
+
+            let instance = instance.shared_instance().raw_instance();
+            instance.get_physical_device_format_properties2(
+                physical_device,
+                vk_format,
+                &mut format_props2,
+            );
+
+            let count = modifier_list.drm_format_modifier_count;
+            let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count as usize];
+
+            let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut props);
+            let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
+
+            instance.get_physical_device_format_properties2(
+                physical_device,
+                vk_format,
+                &mut format_props2,
+            );
+
+            props
+        }
+    }
+
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        // Creating a Vulkan Texture
+
+        for surface in surfaces {
+            let vk_format = match surface.image_buffer.format.code {
+                DrmFourcc::Xrgb8888 => vk::Format::R8G8B8A8_UNORM,
+                DrmFourcc::Xbgr8888 => vk::Format::B8G8R8A8_UNORM,
+                _ => todo!(),
+            };
+
+            let modifier: u64 = surface.image_buffer.format.modifier.into();
+
+            let supported_modifiers = self.get_supported_drm_modifiers(vk_format);
+            if !supported_modifiers
+                .iter()
+                .any(|ext| ext.drm_format_modifier == modifier)
+            {
+                panic!("Requested modifier is not supported!");
+            }
+
+            let mut dma_mem_ext = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+            let dma_layout = vk::SubresourceLayout {
+                offset: surface.image_buffer.plane_offset as u64,
+                size: 0, // set to 0 → driver computes it
+                row_pitch: surface.image_buffer.plane_stride as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            };
+
+            let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+                .drm_format_modifier(modifier)
+                .plane_layouts(std::slice::from_ref(&dma_layout));
+
+            // Link the chain: image_ci → external_memory_ext → drm_modifier_ext
+            dma_mem_ext.p_next = &raw const drm_modifier_ext as *const _;
+
+            let image_ci = vk::ImageCreateInfo::default()
+                .push_next(&mut dma_mem_ext)
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk_format)
+                .extent(vk::Extent3D {
+                    width: surface.bounds.size.width.into(),
+                    height: surface.bounds.size.height.into(),
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+
+            let image = unsafe {
+                let device_hal = self
+                    .resources()
+                    .device
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .expect("The current API is not Vulkan, failed to get a device");
+
+                let device = device_hal.raw_device();
+                device.create_image(&image_ci, None).unwrap()
+            };
+
+            println!("Image: {image:?}");
+        }
     }
 
     fn draw_instances(

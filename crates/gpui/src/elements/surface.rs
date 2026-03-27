@@ -4,7 +4,30 @@ use crate::{
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
+#[cfg(target_os = "linux")]
+use drm_fourcc::{DrmFormat, DrmFourcc};
 use refineable::Refineable;
+
+/// Wrapper around Linux DMA Buffer with
+/// metadata attached to it
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub struct DMABuffer {
+    /// File descriptor of a DMA Buffer
+    pub fd: i64,
+
+    /// Width of the texture
+    pub width: u32,
+    /// Height of the texture
+    pub height: u32,
+
+    /// Describes memory layout of the data
+    pub format: DrmFormat,
+
+    // TODO: Should an array
+    pub plane_offset: u32,
+    pub plane_stride: i32,
+}
 
 /// A source of a surface's content.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,11 +35,21 @@ pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// File Descriptor of DMA-BUF (Linux DRM)
+    #[cfg(target_os = "linux")]
+    Surface(DMABuffer),
 }
 
 #[cfg(target_os = "macos")]
 impl From<CVPixelBuffer> for SurfaceSource {
     fn from(value: CVPixelBuffer) -> Self {
+        SurfaceSource::Surface(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<DMABuffer> for SurfaceSource {
+    fn from(value: DMABuffer) -> Self {
         SurfaceSource::Surface(value)
     }
 }
@@ -29,7 +62,7 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
@@ -97,6 +130,14 @@ impl Element for Surface {
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
+                // TODO: Add support for corner_radii
+                window.paint_surface(new_bounds, surface.clone());
+            }
+            #[cfg(target_os = "linux")]
+            SurfaceSource::Surface(surface) => {
+                let size = crate::size(surface.width.into(), surface.height.into());
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
             }
