@@ -11,6 +11,7 @@ use log::warn;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
 use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -1443,6 +1444,41 @@ impl WgpuRenderer {
         }
     }
 
+    fn find_memory_type(
+        &self,
+        type_filter: u32,
+        required_props: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        unsafe {
+            let device_hal = self
+                .resources()
+                .device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get a device");
+
+            let physical_device = device_hal.raw_physical_device();
+
+            let ctx = self.context.as_ref().unwrap();
+            let ctx = ctx.borrow();
+            let ctx = ctx.as_ref().unwrap();
+
+            let instance = ctx
+                .instance
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get an instance");
+
+            let instance = instance.shared_instance().raw_instance();
+            let mem_props = instance.get_physical_device_memory_properties(physical_device);
+
+            (0..mem_props.memory_type_count).find(|&i| {
+                (type_filter & (1 << i)) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(required_props)
+            })
+        }
+    }
+
     fn draw_surfaces(
         &self,
         surfaces: &[PaintSurface],
@@ -1514,7 +1550,105 @@ impl WgpuRenderer {
                 device.create_image(&image_ci, None).unwrap()
             };
 
-            println!("Image: {image:?}");
+            let mem_req = unsafe {
+                let device_hal = self
+                    .resources()
+                    .device
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .expect("The current API is not Vulkan, failed to get a device");
+
+                let device = device_hal.raw_device();
+                device.get_image_memory_requirements(image)
+            };
+
+            // DMA-BUF is already allocated on the GPU (DEVICE_LOCAL) no need for the CPU mapping
+            let mem_type_idx = self
+                .find_memory_type(
+                    mem_req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )
+                .expect("GPU is ran out of memory");
+
+            // Dedicated allocation is mandatory when importing dma-buf
+            let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+
+            // This dance is needed to call `dup()` on fd since `VkImportMemoryFdInfo` takes
+            // the ownership of the fd. Important: ownership of the fd, not the underlying memory
+            // itself
+            let fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
+            let owned_fd = fd
+                .try_clone_to_owned()
+                .expect("Failed to dup DMA BUF file descriptor");
+
+            let fd = owned_fd.as_raw_fd();
+            std::mem::forget(owned_fd);
+
+            let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                .fd(fd);
+
+            import_fd_info.p_next = &raw const dedicated_alloc_info as *const _;
+
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .push_next(&mut import_fd_info)
+                .allocation_size(mem_req.size)
+                .memory_type_index(mem_type_idx);
+
+            let memory = unsafe {
+                let device_hal = self
+                    .resources()
+                    .device
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .expect("The current API is not Vulkan, failed to get a device");
+
+                let device = device_hal.raw_device();
+                let memory = device
+                    .allocate_memory(&alloc_info, None)
+                    .expect("Failed to allocate memory on GPU");
+
+                device
+                    .bind_image_memory(image, memory, 0)
+                    .expect("Failed to convert DMA-BUF into a VkImage");
+
+                memory
+            };
+
+            let hal_texture = {
+                let desc = wgpu::hal::TextureDescriptor {
+                    label: Some("dma-surface"),
+                    size: wgpu::Extent3d {
+                        width: surface.bounds.size.width.into(),
+                        height: surface.bounds.size.height.into(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    // TODO: Do a proper format conversion from Drmfourcc
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUses::RESOURCE,
+                    memory_flags: wgpu::hal::MemoryFlags::empty(),
+                    view_formats: vec![],
+                };
+
+                let drop_callback: Option<wgpu::hal::DropCallback> = Some(Box::new(|| {
+                    println!("dmabuf HAL texture dropped");
+                }));
+
+                let wgpu_memory = wgpu::hal::vulkan::TextureMemory::Dedicated(memory);
+
+                unsafe {
+                    let device_hal = self
+                        .resources()
+                        .device
+                        .as_hal::<wgpu::hal::api::Vulkan>()
+                        .expect("The current API is not Vulkan, failed to get a device");
+
+                    device_hal.texture_from_raw(image, &desc, drop_callback, wgpu_memory)
+                }
+            };
+
+            println!("Texture: {image:?}");
         }
     }
 
