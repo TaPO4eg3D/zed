@@ -1527,8 +1527,8 @@ impl WgpuRenderer {
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk_format)
                 .extent(vk::Extent3D {
-                    width: surface.bounds.size.width.into(),
-                    height: surface.bounds.size.height.into(),
+                    width: surface.image_buffer.width,
+                    height: surface.image_buffer.height,
                     depth: 1,
                 })
                 .mip_levels(1)
@@ -1561,7 +1561,7 @@ impl WgpuRenderer {
                 device.get_image_memory_requirements(image)
             };
 
-            // DMA-BUF is already allocated on the GPU (DEVICE_LOCAL) no need for the CPU mapping
+            // `dma-buf` is already allocated on the GPU (DEVICE_LOCAL) no need for the CPU mapping
             let mem_type_idx = self
                 .find_memory_type(
                     mem_req.memory_type_bits,
@@ -1569,11 +1569,11 @@ impl WgpuRenderer {
                 )
                 .expect("GPU is ran out of memory");
 
-            // Dedicated allocation is mandatory when importing dma-buf
+            // Dedicated allocation is mandatory when importing `dma-buf`
             let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
 
-            // This dance is needed to call `dup()` on fd since `VkImportMemoryFdInfo` takes
-            // the ownership of the fd. Important: ownership of the fd, not the underlying memory
+            // This dance is needed to call `dup()` on `fd` since `VkImportMemoryFdInfo` takes
+            // the ownership of the `fd`. Important: ownership of the `fd`, not the underlying memory
             // itself
             let fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
             let owned_fd = fd
@@ -1613,18 +1613,18 @@ impl WgpuRenderer {
                 memory
             };
 
-            let hal_texture = {
+            let texture = {
                 let desc = wgpu::hal::TextureDescriptor {
                     label: Some("dma-surface"),
                     size: wgpu::Extent3d {
-                        width: surface.bounds.size.width.into(),
-                        height: surface.bounds.size.height.into(),
+                        width: surface.image_buffer.width,
+                        height: surface.image_buffer.height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    // TODO: Do a proper format conversion from Drmfourcc
+                    // TODO: Do a proper format conversion from `drm-fourcc`
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     usage: wgpu::TextureUses::RESOURCE,
                     memory_flags: wgpu::hal::MemoryFlags::empty(),
