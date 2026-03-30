@@ -11,7 +11,7 @@ use log::warn;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
 use std::num::NonZeroU64;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -46,7 +46,10 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    metadata: [u32; 4],
 }
+
+const SURFACE_SOURCE_COLOR: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1242,18 +1245,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(range) => {
-                            self.draw_surfaces(
-                                &scene.surfaces[range],
-                                &mut instance_offset,
-                                &mut pass,
-                            );
-                            println!("surface!");
-
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                        PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -1479,177 +1475,288 @@ impl WgpuRenderer {
         }
     }
 
+    fn surface_texture_formats(format: DrmFourcc) -> Option<(vk::Format, wgpu::TextureFormat)> {
+        match format {
+            DrmFourcc::Xrgb8888 => {
+                Some((vk::Format::B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm))
+            }
+            DrmFourcc::Xbgr8888 => {
+                Some((vk::Format::R8G8B8A8_UNORM, wgpu::TextureFormat::Rgba8Unorm))
+            }
+            _ => None,
+        }
+    }
+
+    fn import_surface_texture(
+        &self,
+        surface: &PaintSurface,
+        vk_format: vk::Format,
+        wgpu_format: wgpu::TextureFormat,
+        modifier: u64,
+    ) -> anyhow::Result<wgpu::Texture> {
+        let resources = self.resources();
+        let device_hal = unsafe {
+            resources
+                .device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or_else(|| anyhow::anyhow!("The current API is not Vulkan"))?
+        };
+        let device = device_hal.raw_device();
+
+        let mut dma_memory_ext = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        let dma_layout = vk::SubresourceLayout {
+            offset: surface.image_buffer.plane_offset as u64,
+            size: 0,
+            row_pitch: surface.image_buffer.plane_stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+
+        let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(std::slice::from_ref(&dma_layout));
+
+        dma_memory_ext.p_next = &raw const drm_modifier_ext as *const _;
+
+        let extent = wgpu::Extent3d {
+            width: surface.image_buffer.width,
+            height: surface.image_buffer.height,
+            depth_or_array_layers: 1,
+        };
+
+        let image_create_info = vk::ImageCreateInfo::default()
+            .push_next(&mut dma_memory_ext)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: extent.depth_or_array_layers,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = unsafe {
+            device
+                .create_image(&image_create_info, None)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to create imported surface image: {error:?}")
+                })?
+        };
+
+        let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
+
+        let memory_type_index = self
+            .find_memory_type(
+                memory_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .ok_or_else(|| anyhow::anyhow!("No compatible GPU memory type for imported surface"))?;
+
+        let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
+        let owned_fd = borrowed_fd.try_clone_to_owned().map_err(|error| {
+            anyhow::anyhow!("Failed to duplicate DMA-BUF file descriptor: {error}")
+        })?;
+        let imported_fd = owned_fd.into_raw_fd();
+
+        let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(imported_fd);
+        import_fd_info.p_next = &raw const dedicated_alloc_info as *const _;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .push_next(&mut import_fd_info)
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(imported_fd) };
+                unsafe {
+                    device.destroy_image(image, None);
+                }
+                return Err(anyhow::anyhow!(
+                    "Failed to allocate memory for imported surface: {error:?}"
+                ));
+            }
+        };
+
+        if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            return Err(anyhow::anyhow!(
+                "Failed to bind imported surface memory: {error:?}"
+            ));
+        }
+
+        let hal_descriptor = wgpu::hal::TextureDescriptor {
+            label: Some("dma-surface"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+
+        let hal_texture = unsafe {
+            device_hal.texture_from_raw(
+                image,
+                &hal_descriptor,
+                None,
+                wgpu::hal::vulkan::TextureMemory::Dedicated(memory),
+            )
+        };
+
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("dma-surface"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+
+        let texture = unsafe {
+            resources
+                .device
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &descriptor)
+        };
+
+        Ok(texture)
+    }
+
     fn draw_surfaces(
         &self,
         surfaces: &[PaintSurface],
-        instance_offset: &mut u64,
+        _instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
-    ) {
-        // Creating a Vulkan Texture
+    ) -> bool {
+        if surfaces.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+        let surface_params_size = std::mem::size_of::<SurfaceParams>() as u64;
+        let Some(surface_params_size) = NonZeroU64::new(surface_params_size) else {
+            warn!("SurfaceParams has zero size");
+            return true;
+        };
+
+        let surface_params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_params_buffer"),
+            size: surface_params_size.get(),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        pass.set_pipeline(&resources.pipelines.surfaces);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
 
         for surface in surfaces {
-            let vk_format = match surface.image_buffer.format.code {
-                DrmFourcc::Xrgb8888 => vk::Format::R8G8B8A8_UNORM,
-                DrmFourcc::Xbgr8888 => vk::Format::B8G8R8A8_UNORM,
-                _ => todo!(),
+            if surface.image_buffer.plane_stride <= 0 {
+                warn!(
+                    "Skipping surface with non-positive plane stride {}",
+                    surface.image_buffer.plane_stride
+                );
+                continue;
+            }
+
+            let Some((vk_format, wgpu_format)) =
+                Self::surface_texture_formats(surface.image_buffer.format.code)
+            else {
+                warn!(
+                    "Skipping surface with unsupported DRM format {:?}",
+                    surface.image_buffer.format.code
+                );
+                continue;
             };
 
             let modifier: u64 = surface.image_buffer.format.modifier.into();
-
             let supported_modifiers = self.get_supported_drm_modifiers(vk_format);
             if !supported_modifiers
                 .iter()
-                .any(|ext| ext.drm_format_modifier == modifier)
+                .any(|properties| properties.drm_format_modifier == modifier)
             {
-                panic!("Requested modifier is not supported!");
+                warn!(
+                    "Skipping surface with unsupported DRM modifier {modifier:#x} for format {:?}",
+                    surface.image_buffer.format.code
+                );
+                continue;
             }
 
-            let mut dma_mem_ext = vk::ExternalMemoryImageCreateInfo::default()
-                .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-            let dma_layout = vk::SubresourceLayout {
-                offset: surface.image_buffer.plane_offset as u64,
-                size: 0, // set to 0 → driver computes it
-                row_pitch: surface.image_buffer.plane_stride as u64,
-                array_pitch: 0,
-                depth_pitch: 0,
-            };
-
-            let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-                .drm_format_modifier(modifier)
-                .plane_layouts(std::slice::from_ref(&dma_layout));
-
-            // Link the chain: image_ci → external_memory_ext → drm_modifier_ext
-            dma_mem_ext.p_next = &raw const drm_modifier_ext as *const _;
-
-            let image_ci = vk::ImageCreateInfo::default()
-                .push_next(&mut dma_mem_ext)
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk_format)
-                .extent(vk::Extent3D {
-                    width: surface.image_buffer.width,
-                    height: surface.image_buffer.height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED);
-
-            let image = unsafe {
-                let device_hal = self
-                    .resources()
-                    .device
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .expect("The current API is not Vulkan, failed to get a device");
-
-                let device = device_hal.raw_device();
-                device.create_image(&image_ci, None).unwrap()
-            };
-
-            let mem_req = unsafe {
-                let device_hal = self
-                    .resources()
-                    .device
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .expect("The current API is not Vulkan, failed to get a device");
-
-                let device = device_hal.raw_device();
-                device.get_image_memory_requirements(image)
-            };
-
-            // `dma-buf` is already allocated on the GPU (DEVICE_LOCAL) no need for the CPU mapping
-            let mem_type_idx = self
-                .find_memory_type(
-                    mem_req.memory_type_bits,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                )
-                .expect("GPU is ran out of memory");
-
-            // Dedicated allocation is mandatory when importing `dma-buf`
-            let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
-
-            // This dance is needed to call `dup()` on `fd` since `VkImportMemoryFdInfo` takes
-            // the ownership of the `fd`. Important: ownership of the `fd`, not the underlying memory
-            // itself
-            let fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
-            let owned_fd = fd
-                .try_clone_to_owned()
-                .expect("Failed to dup DMA BUF file descriptor");
-
-            let fd = owned_fd.as_raw_fd();
-            std::mem::forget(owned_fd);
-
-            let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
-                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(fd);
-
-            import_fd_info.p_next = &raw const dedicated_alloc_info as *const _;
-
-            let alloc_info = vk::MemoryAllocateInfo::default()
-                .push_next(&mut import_fd_info)
-                .allocation_size(mem_req.size)
-                .memory_type_index(mem_type_idx);
-
-            let memory = unsafe {
-                let device_hal = self
-                    .resources()
-                    .device
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .expect("The current API is not Vulkan, failed to get a device");
-
-                let device = device_hal.raw_device();
-                let memory = device
-                    .allocate_memory(&alloc_info, None)
-                    .expect("Failed to allocate memory on GPU");
-
-                device
-                    .bind_image_memory(image, memory, 0)
-                    .expect("Failed to convert DMA-BUF into a VkImage");
-
-                memory
-            };
-
-            let texture = {
-                let desc = wgpu::hal::TextureDescriptor {
-                    label: Some("dma-surface"),
-                    size: wgpu::Extent3d {
-                        width: surface.image_buffer.width,
-                        height: surface.image_buffer.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    // TODO: Do a proper format conversion from `drm-fourcc`
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUses::RESOURCE,
-                    memory_flags: wgpu::hal::MemoryFlags::empty(),
-                    view_formats: vec![],
+            let texture =
+                match self.import_surface_texture(surface, vk_format, wgpu_format, modifier) {
+                    Ok(texture) => texture,
+                    Err(error) => {
+                        warn!("Failed to import DMA-BUF surface texture: {error:#}");
+                        continue;
+                    }
                 };
 
-                let drop_callback: Option<wgpu::hal::DropCallback> = Some(Box::new(|| {
-                    println!("dmabuf HAL texture dropped");
-                }));
-
-                let wgpu_memory = wgpu::hal::vulkan::TextureMemory::Dedicated(memory);
-
-                unsafe {
-                    let device_hal = self
-                        .resources()
-                        .device
-                        .as_hal::<wgpu::hal::api::Vulkan>()
-                        .expect("The current API is not Vulkan, failed to get a device");
-
-                    device_hal.texture_from_raw(image, &desc, drop_callback, wgpu_memory)
-                }
+            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let surface_params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                metadata: [SURFACE_SOURCE_COLOR, 0, 0, 0],
             };
 
-            println!("Texture: {image:?}");
+            resources.queue.write_buffer(
+                &surface_params_buffer,
+                0,
+                bytemuck::bytes_of(&surface_params),
+            );
+
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &surface_params_buffer,
+                                offset: 0,
+                                size: Some(surface_params_size),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
         }
+
+        true
     }
 
     fn draw_instances(

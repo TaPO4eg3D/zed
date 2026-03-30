@@ -1288,12 +1288,15 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    metadata: vec4<u32>,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
-@group(1) @binding(1) var t_y: texture_2d<f32>;
-@group(1) @binding(2) var t_cb_cr: texture_2d<f32>;
+@group(1) @binding(1) var t_surface_primary: texture_2d<f32>;
+@group(1) @binding(2) var t_surface_secondary: texture_2d<f32>;
 @group(1) @binding(3) var s_surface: sampler;
+
+const SURFACE_SOURCE_YCBCR: u32 = 0u;
 
 const ycbcr_to_RGB = mat4x4<f32>(
     vec4<f32>( 1.0000f,  1.0000f,  1.0000f, 0.0),
@@ -1326,9 +1329,14 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
+    if (surface_locals.metadata.x != SURFACE_SOURCE_YCBCR) {
+        let color = textureSampleLevel(t_surface_primary, s_surface, input.texture_position, 0.0);
+        return vec4<f32>(color.rgb, 1.0);
+    }
+
     let y_cb_cr = vec4<f32>(
-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
+        textureSampleLevel(t_surface_primary, s_surface, input.texture_position, 0.0).r,
+        textureSampleLevel(t_surface_secondary, s_surface, input.texture_position, 0.0).rg,
         1.0);
 
     return ycbcr_to_RGB * y_cb_cr;
