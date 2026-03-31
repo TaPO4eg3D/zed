@@ -115,6 +115,7 @@ struct WgpuResources {
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
+    surface_buffer: wgpu::Buffer,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
@@ -381,6 +382,14 @@ impl WgpuRenderer {
             mapped_at_creation: false,
         });
 
+        let surface_params_size = std::mem::size_of::<SurfaceParams>() as u64;
+        let surface_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_buffer"),
+            size: surface_params_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals_bind_group"),
             layout: &bind_group_layouts.globals,
@@ -447,6 +456,7 @@ impl WgpuRenderer {
             globals_bind_group,
             path_globals_bind_group,
             instance_buffer,
+            surface_buffer,
             // Defer intermediate texture creation to first draw call via ensure_intermediate_textures().
             // This avoids panics when the device/surface is in an invalid state during initialization.
             path_intermediate_texture: None,
@@ -1562,6 +1572,8 @@ impl WgpuRenderer {
 
         let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
 
+        // This dance is needed to call `dup()` on the file descriptor since `VkImportMemoryFdInfoKHR`
+        // takes the ownership of the `fd` (not the underlying memory itself)
         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
         let owned_fd = borrowed_fd.try_clone_to_owned().map_err(|error| {
             anyhow::anyhow!("Failed to duplicate DMA-BUF file descriptor: {error}")
@@ -1656,15 +1668,9 @@ impl WgpuRenderer {
         let surface_params_size = std::mem::size_of::<SurfaceParams>() as u64;
         let Some(surface_params_size) = NonZeroU64::new(surface_params_size) else {
             warn!("SurfaceParams has zero size");
+
             return true;
         };
-
-        let surface_params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("surface_params_buffer"),
-            size: surface_params_size.get(),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         pass.set_pipeline(&resources.pipelines.surfaces);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
@@ -1718,7 +1724,7 @@ impl WgpuRenderer {
             };
 
             resources.queue.write_buffer(
-                &surface_params_buffer,
+                &resources.surface_buffer,
                 0,
                 bytemuck::bytes_of(&surface_params),
             );
@@ -1732,7 +1738,7 @@ impl WgpuRenderer {
                         wgpu::BindGroupEntry {
                             binding: 0,
                             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &surface_params_buffer,
+                                buffer: &resources.surface_buffer,
                                 offset: 0,
                                 size: Some(surface_params_size),
                             }),
