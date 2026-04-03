@@ -7855,6 +7855,7 @@ dependencies = [
  "itertools 0.14.0",
  "js-sys",
  "log",
+ "nix 0.29.0",
  "parking_lot",
  "pollster 0.4.0",
  "profiling",

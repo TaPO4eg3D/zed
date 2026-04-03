@@ -14,7 +14,7 @@ use refineable::Refineable;
 #[cfg(target_os = "linux")]
 pub struct DMABuffer {
     /// File descriptor of a DMA Buffer
-    pub fd: i64,
+    pub fd: i32,
 
     /// Width of the texture
     pub width: u32,
@@ -24,8 +24,9 @@ pub struct DMABuffer {
     /// Describes memory layout of the data
     pub format: DrmFormat,
 
-    // TODO: Should an array
+    /// Currently only packed layout is supported. Plane offset
     pub plane_offset: u32,
+    /// Currently only packed layout is supported. Plane stride
     pub plane_stride: i32,
 }
 

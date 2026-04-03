@@ -2,20 +2,23 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use drm_fourcc::DrmFourcc;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DMABuffer, DevicePixels, GpuSpecs, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::cell::RefCell;
+use smallvec::SmallVec;
+use std::cell::{Ref, RefCell};
 use std::num::NonZeroU64;
+use std::ops::Deref;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use ash::vk::{self, ExternalMemoryHandleTypeFlags};
+use nix::fcntl::{FcntlArg, fcntl};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -103,6 +106,298 @@ struct WgpuBindGroupLayouts {
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
+struct DmaTextureCache {
+    textures: RefCell<SmallVec<[(i32, wgpu::Texture); 8]>>,
+}
+
+impl DmaTextureCache {
+    fn new() -> Self {
+        Self {
+            textures: RefCell::new(SmallVec::new()),
+        }
+    }
+
+    fn get_or_create(
+        &self,
+        renderer: &WgpuRenderer,
+        surface: &PaintSurface,
+    ) -> Option<wgpu::Texture> {
+        // Check if we already mapped this DMA-BUF to wgpu::Texture
+        let fd = surface.image_buffer.fd;
+
+        {
+            let textures = self.textures.borrow();
+
+            if let Some((_, texture)) = textures.iter().find(|(cfd, _)| *cfd == fd) {
+                println!("cache hit");
+                return Some(texture.clone());
+            }
+        }
+
+        let Some((vk_format, wgpu_format)) =
+            Self::surface_texture_formats(surface.image_buffer.format.code)
+        else {
+            warn!(
+                "Unable to render surface due to unsuported DRM format {:?}",
+                surface.image_buffer.format.code
+            );
+
+            return None;
+        };
+
+        let modifier: u64 = surface.image_buffer.format.modifier.into();
+        let supported_modifiers = Self::get_supported_drm_modifiers(renderer, vk_format);
+        if !supported_modifiers
+            .iter()
+            .any(|properties| properties.drm_format_modifier == modifier)
+        {
+            warn!(
+                "Skipping surface with unsupported DRM modifier {modifier:#x} for format {:?}",
+                surface.image_buffer.format.code
+            );
+
+            return None;
+        }
+
+        let device_hal = renderer.get_device_hal();
+        let device = device_hal.raw_device();
+
+        let mut dma_memory_ext = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+
+        let dma_layout = vk::SubresourceLayout {
+            offset: surface.image_buffer.plane_offset as u64,
+            size: 0,
+            row_pitch: surface.image_buffer.plane_stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+
+        let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(std::slice::from_ref(&dma_layout));
+
+        dma_memory_ext.p_next = &raw const drm_modifier_ext as *const _;
+
+        let extent = wgpu::Extent3d {
+            width: surface.image_buffer.width,
+            height: surface.image_buffer.height,
+            depth_or_array_layers: 1,
+        };
+
+        let image_create_info = vk::ImageCreateInfo::default()
+            .push_next(&mut dma_memory_ext)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: extent.depth_or_array_layers,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = unsafe {
+            match device.create_image(&image_create_info, None) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!("Failed to create VkImage: {err:?}");
+
+                    return None;
+                }
+            }
+        };
+
+        let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
+
+        let memory_type_index = match Self::find_memory_type(
+            renderer,
+            memory_requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Some(value) => value,
+            None => {
+                warn!("No compatible GPU memory type for the imported surface");
+
+                return None;
+            }
+        };
+
+        let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+
+        // This dance is needed to call `dup()` on the file descriptor since `VkImportMemoryFdInfoKHR`
+        // takes the ownership of the `fd` (not the underlying memory itself)
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
+        let owned_fd = match borrowed_fd.try_clone_to_owned() {
+            Ok(value) => value,
+            Err(err) => {
+                warn!("Failed to duplicate the file desriptor of DMA-BUF: {err:?}");
+
+                return None;
+            }
+        };
+
+        let imported_fd = owned_fd.into_raw_fd();
+
+        let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(imported_fd);
+        import_fd_info.p_next = &raw const dedicated_alloc_info as *const _;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .push_next(&mut import_fd_info)
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
+            Ok(memory) => memory,
+            Err(err) => {
+                let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(imported_fd) };
+                unsafe {
+                    device.destroy_image(image, None);
+                }
+                warn!("Failed to allocate memory for imported surface: {err:?}");
+
+                return None;
+            }
+        };
+
+        if let Err(err) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_image(image, None);
+            }
+            warn!("Failed to bind imported surface memory: {err:?}");
+
+            return None;
+        }
+
+        let hal_descriptor = wgpu::hal::TextureDescriptor {
+            label: Some("dma-surface"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+
+        let hal_texture = unsafe {
+            device_hal.texture_from_raw(
+                image,
+                &hal_descriptor,
+                None,
+                wgpu::hal::vulkan::TextureMemory::Dedicated(memory),
+            )
+        };
+
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("dma-surface"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+
+        let resources = renderer.resources();
+        let texture = unsafe {
+            resources
+                .device
+                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &descriptor)
+        };
+
+        let mut textures = self.textures.borrow_mut();
+        textures.push((fd, texture.clone()));
+
+        Some(texture)
+    }
+
+    fn surface_texture_formats(format: DrmFourcc) -> Option<(vk::Format, wgpu::TextureFormat)> {
+        match format {
+            DrmFourcc::Xrgb8888 => {
+                Some((vk::Format::B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm))
+            }
+            DrmFourcc::Xbgr8888 => {
+                Some((vk::Format::R8G8B8A8_UNORM, wgpu::TextureFormat::Rgba8Unorm))
+            }
+            _ => None,
+        }
+    }
+
+    fn find_memory_type(
+        renderer: &WgpuRenderer,
+        type_filter: u32,
+        required_props: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        unsafe {
+            let device_hal = renderer.get_device_hal();
+            let physical_device = device_hal.raw_physical_device();
+
+            let instance = renderer.get_vk_instance();
+            let mem_props = instance.get_physical_device_memory_properties(physical_device);
+
+            (0..mem_props.memory_type_count).find(|&i| {
+                (type_filter & (1 << i)) != 0
+                    && mem_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(required_props)
+            })
+        }
+    }
+
+    fn get_supported_drm_modifiers(
+        renderer: &WgpuRenderer,
+        vk_format: vk::Format,
+    ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
+
+        unsafe {
+            let device_hal = renderer.get_device_hal();
+            let physical_device = device_hal.raw_physical_device();
+
+            let instance = renderer.get_vk_instance();
+            instance.get_physical_device_format_properties2(
+                physical_device,
+                vk_format,
+                &mut format_props2,
+            );
+
+            let count = modifier_list.drm_format_modifier_count;
+            // FIXME: Preallocate the buffer and reuse it
+            let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count as usize];
+
+            let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut props);
+            let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
+
+            instance.get_physical_device_format_properties2(
+                physical_device,
+                vk_format,
+                &mut format_props2,
+            );
+
+            props
+        }
+    }
+
+    /// Removes mapped textures of staled DMA-BUFs
+    fn flush(&self) {
+        let mut textures = self.textures.borrow_mut();
+        textures.retain(|(fd, _)| fcntl(*fd, FcntlArg::F_GETFD).is_ok());
+    }
+}
+
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
     device: Arc<wgpu::Device>,
@@ -146,6 +441,7 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    dma_texture_cache: DmaTextureCache,
 }
 
 impl WgpuRenderer {
@@ -485,6 +781,7 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
+            dma_texture_cache: DmaTextureCache::new(),
         })
     }
 
@@ -1401,259 +1698,6 @@ impl WgpuRenderer {
         )
     }
 
-    fn get_supported_drm_modifiers(
-        &self,
-        vk_format: vk::Format,
-    ) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
-        let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
-
-        unsafe {
-            let device_hal = self
-                .resources()
-                .device
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .expect("The current API is not Vulkan, failed to get a device");
-
-            let physical_device = device_hal.raw_physical_device();
-
-            let ctx = self.context.as_ref().unwrap();
-            let ctx = ctx.borrow();
-            let ctx = ctx.as_ref().unwrap();
-
-            let instance = ctx
-                .instance
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .expect("The current API is not Vulkan, failed to get an instance");
-
-            let instance = instance.shared_instance().raw_instance();
-            instance.get_physical_device_format_properties2(
-                physical_device,
-                vk_format,
-                &mut format_props2,
-            );
-
-            let count = modifier_list.drm_format_modifier_count;
-            let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); count as usize];
-
-            let mut modifier_list = vk::DrmFormatModifierPropertiesListEXT::default()
-                .drm_format_modifier_properties(&mut props);
-            let mut format_props2 = vk::FormatProperties2::default().push_next(&mut modifier_list);
-
-            instance.get_physical_device_format_properties2(
-                physical_device,
-                vk_format,
-                &mut format_props2,
-            );
-
-            props
-        }
-    }
-
-    fn find_memory_type(
-        &self,
-        type_filter: u32,
-        required_props: vk::MemoryPropertyFlags,
-    ) -> Option<u32> {
-        unsafe {
-            let device_hal = self
-                .resources()
-                .device
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .expect("The current API is not Vulkan, failed to get a device");
-
-            let physical_device = device_hal.raw_physical_device();
-
-            let ctx = self.context.as_ref().unwrap();
-            let ctx = ctx.borrow();
-            let ctx = ctx.as_ref().unwrap();
-
-            let instance = ctx
-                .instance
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .expect("The current API is not Vulkan, failed to get an instance");
-
-            let instance = instance.shared_instance().raw_instance();
-            let mem_props = instance.get_physical_device_memory_properties(physical_device);
-
-            (0..mem_props.memory_type_count).find(|&i| {
-                (type_filter & (1 << i)) != 0
-                    && mem_props.memory_types[i as usize]
-                        .property_flags
-                        .contains(required_props)
-            })
-        }
-    }
-
-    fn surface_texture_formats(format: DrmFourcc) -> Option<(vk::Format, wgpu::TextureFormat)> {
-        match format {
-            DrmFourcc::Xrgb8888 => {
-                Some((vk::Format::B8G8R8A8_UNORM, wgpu::TextureFormat::Bgra8Unorm))
-            }
-            DrmFourcc::Xbgr8888 => {
-                Some((vk::Format::R8G8B8A8_UNORM, wgpu::TextureFormat::Rgba8Unorm))
-            }
-            _ => None,
-        }
-    }
-
-    fn import_surface_texture(
-        &self,
-        surface: &PaintSurface,
-        vk_format: vk::Format,
-        wgpu_format: wgpu::TextureFormat,
-        modifier: u64,
-    ) -> anyhow::Result<wgpu::Texture> {
-        let resources = self.resources();
-        let device_hal = unsafe {
-            resources
-                .device
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .ok_or_else(|| anyhow::anyhow!("The current API is not Vulkan"))?
-        };
-        let device = device_hal.raw_device();
-
-        let mut dma_memory_ext = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-        let dma_layout = vk::SubresourceLayout {
-            offset: surface.image_buffer.plane_offset as u64,
-            size: 0,
-            row_pitch: surface.image_buffer.plane_stride as u64,
-            array_pitch: 0,
-            depth_pitch: 0,
-        };
-
-        let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-            .drm_format_modifier(modifier)
-            .plane_layouts(std::slice::from_ref(&dma_layout));
-
-        dma_memory_ext.p_next = &raw const drm_modifier_ext as *const _;
-
-        let extent = wgpu::Extent3d {
-            width: surface.image_buffer.width,
-            height: surface.image_buffer.height,
-            depth_or_array_layers: 1,
-        };
-
-        let image_create_info = vk::ImageCreateInfo::default()
-            .push_next(&mut dma_memory_ext)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk_format)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: extent.depth_or_array_layers,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-
-        let image = unsafe {
-            device
-                .create_image(&image_create_info, None)
-                .map_err(|error| {
-                    anyhow::anyhow!("Failed to create imported surface image: {error:?}")
-                })?
-        };
-
-        let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
-
-        let memory_type_index = self
-            .find_memory_type(
-                memory_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .ok_or_else(|| anyhow::anyhow!("No compatible GPU memory type for imported surface"))?;
-
-        let dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
-
-        // This dance is needed to call `dup()` on the file descriptor since `VkImportMemoryFdInfoKHR`
-        // takes the ownership of the `fd` (not the underlying memory itself)
-        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(surface.image_buffer.fd as i32) };
-        let owned_fd = borrowed_fd.try_clone_to_owned().map_err(|error| {
-            anyhow::anyhow!("Failed to duplicate DMA-BUF file descriptor: {error}")
-        })?;
-        let imported_fd = owned_fd.into_raw_fd();
-
-        let mut import_fd_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(imported_fd);
-        import_fd_info.p_next = &raw const dedicated_alloc_info as *const _;
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .push_next(&mut import_fd_info)
-            .allocation_size(memory_requirements.size)
-            .memory_type_index(memory_type_index);
-
-        let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                let _ = unsafe { std::os::fd::OwnedFd::from_raw_fd(imported_fd) };
-                unsafe {
-                    device.destroy_image(image, None);
-                }
-                return Err(anyhow::anyhow!(
-                    "Failed to allocate memory for imported surface: {error:?}"
-                ));
-            }
-        };
-
-        if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            unsafe {
-                device.free_memory(memory, None);
-                device.destroy_image(image, None);
-            }
-            return Err(anyhow::anyhow!(
-                "Failed to bind imported surface memory: {error:?}"
-            ));
-        }
-
-        let hal_descriptor = wgpu::hal::TextureDescriptor {
-            label: Some("dma-surface"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu_format,
-            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
-            memory_flags: wgpu::hal::MemoryFlags::empty(),
-            view_formats: Vec::new(),
-        };
-
-        let hal_texture = unsafe {
-            device_hal.texture_from_raw(
-                image,
-                &hal_descriptor,
-                None,
-                wgpu::hal::vulkan::TextureMemory::Dedicated(memory),
-            )
-        };
-
-        let descriptor = wgpu::TextureDescriptor {
-            label: Some("dma-surface"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        };
-
-        let texture = unsafe {
-            resources
-                .device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &descriptor)
-        };
-
-        Ok(texture)
-    }
-
     fn draw_surfaces(
         &self,
         surfaces: &[PaintSurface],
@@ -1684,37 +1728,14 @@ impl WgpuRenderer {
                 continue;
             }
 
-            let Some((vk_format, wgpu_format)) =
-                Self::surface_texture_formats(surface.image_buffer.format.code)
-            else {
-                warn!(
-                    "Skipping surface with unsupported DRM format {:?}",
-                    surface.image_buffer.format.code
-                );
-                continue;
+            let texture = match self.dma_texture_cache.get_or_create(self, surface) {
+                Some(texture) => texture,
+                None => {
+                    warn!("Failed to import DMA-BUF surface texture");
+
+                    continue;
+                }
             };
-
-            let modifier: u64 = surface.image_buffer.format.modifier.into();
-            let supported_modifiers = self.get_supported_drm_modifiers(vk_format);
-            if !supported_modifiers
-                .iter()
-                .any(|properties| properties.drm_format_modifier == modifier)
-            {
-                warn!(
-                    "Skipping surface with unsupported DRM modifier {modifier:#x} for format {:?}",
-                    surface.image_buffer.format.code
-                );
-                continue;
-            }
-
-            let texture =
-                match self.import_surface_texture(surface, vk_format, wgpu_format, modifier) {
-                    Ok(texture) => texture,
-                    Err(error) => {
-                        warn!("Failed to import DMA-BUF surface texture: {error:#}");
-                        continue;
-                    }
-                };
 
             let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let surface_params = SurfaceParams {
@@ -2084,6 +2105,36 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+
+    // TODO: Should be gated behind the screensharing feature
+    fn get_device_hal(&self) -> impl Deref<Target = wgpu::hal::vulkan::Device> {
+        unsafe {
+            self.resources()
+                .device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get the underlying device")
+        }
+    }
+
+    // TODO: Should be gated behind the screensharing feature
+    fn get_vk_instance(&self) -> ash::Instance {
+        let device_hal = self.get_device_hal();
+
+        unsafe {
+            let physical_device = device_hal.raw_physical_device();
+
+            let ctx = self.context.as_ref().unwrap();
+            let ctx = ctx.borrow();
+            let ctx = ctx.as_ref().unwrap();
+
+            let instance = ctx
+                .instance
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("The current API is not Vulkan, failed to get an instance");
+
+            instance.shared_instance().raw_instance().clone()
+        }
     }
 }
 
