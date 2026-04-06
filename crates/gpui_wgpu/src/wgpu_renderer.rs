@@ -276,7 +276,7 @@ impl DmaTextureCache {
                 unsafe {
                     device.destroy_image(image, None);
                 }
-                warn!("Failed to allocate memory for imported surface: {err:?}");
+                warn!("Failed to allocate memory for the imported surface: {err:?}");
 
                 return None;
             }
@@ -431,8 +431,7 @@ struct WgpuResources {
     surface: wgpu::Surface<'static>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
-    atlas_sampler: wgpu::Sampler,
-    surface_sampler: wgpu::Sampler,
+    texture_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -675,18 +674,10 @@ impl WgpuRenderer {
             dual_source_blending,
         );
 
-        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas_sampler"),
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("texture_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let surface_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("surface_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -782,8 +773,7 @@ impl WgpuRenderer {
             surface,
             pipelines,
             bind_group_layouts,
-            atlas_sampler,
-            surface_sampler,
+            texture_sampler,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -912,7 +902,7 @@ impl WgpuRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -922,7 +912,7 @@ impl WgpuRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -931,7 +921,7 @@ impl WgpuRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -1830,7 +1820,7 @@ impl WgpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&resources.surface_sampler),
+                            resource: wgpu::BindingResource::Sampler(&resources.texture_sampler),
                         },
                     ],
                 });
@@ -1906,7 +1896,7 @@ impl WgpuRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        resource: wgpu::BindingResource::Sampler(&resources.texture_sampler),
                     },
                 ],
             });
