@@ -2,15 +2,15 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use drm_fourcc::DrmFourcc;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DMABuffer, DevicePixels, GpuSpecs, MonochromeSprite,
-    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, PaintSurface,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smallvec::SmallVec;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd};
@@ -52,6 +52,7 @@ struct SurfaceParams {
     metadata: [u32; 4],
 }
 
+const SURFACE_SOURCE_YCBCR: u32 = 0;
 const SURFACE_SOURCE_COLOR: u32 = 1;
 
 #[repr(C)]
@@ -129,7 +130,6 @@ impl DmaTextureCache {
             let textures = self.textures.borrow();
 
             if let Some((_, texture)) = textures.iter().find(|(cfd, _)| *cfd == fd) {
-                println!("cache hit");
                 return Some(texture.clone());
             }
         }
@@ -138,7 +138,7 @@ impl DmaTextureCache {
             Self::surface_texture_formats(surface.image_buffer.format.code)
         else {
             warn!(
-                "Unable to render surface due to unsuported DRM format {:?}",
+                "Unable to render surface due to unsupported DRM format {:?}",
                 surface.image_buffer.format.code
             );
 
@@ -151,7 +151,7 @@ impl DmaTextureCache {
             .iter()
             .any(|properties| properties.drm_format_modifier == modifier)
         {
-            warn!(
+            println!(
                 "Skipping surface with unsupported DRM modifier {modifier:#x} for format {:?}",
                 surface.image_buffer.format.code
             );
@@ -165,17 +165,22 @@ impl DmaTextureCache {
         let mut dma_memory_ext = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
-        let dma_layout = vk::SubresourceLayout {
-            offset: surface.image_buffer.plane_offset as u64,
-            size: 0,
-            row_pitch: surface.image_buffer.plane_stride as u64,
-            array_pitch: 0,
-            depth_pitch: 0,
-        };
+        let mut planes: SmallVec<[vk::SubresourceLayout; 2]> = SmallVec::new();
+        for plane in &surface.image_buffer.planes {
+            let dma_layout = vk::SubresourceLayout {
+                offset: plane.offset as u64,
+                size: 0,
+                row_pitch: plane.stride as u64,
+                array_pitch: 0,
+                depth_pitch: 0,
+            };
+
+            planes.push(dma_layout);
+        }
 
         let drm_modifier_ext = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
             .drm_format_modifier(modifier)
-            .plane_layouts(std::slice::from_ref(&dma_layout));
+            .plane_layouts(planes.as_slice());
 
         dma_memory_ext.p_next = &raw const drm_modifier_ext as *const _;
 
@@ -330,6 +335,10 @@ impl DmaTextureCache {
             DrmFourcc::Xbgr8888 => {
                 Some((vk::Format::R8G8B8A8_UNORM, wgpu::TextureFormat::Rgba8Unorm))
             }
+            DrmFourcc::Nv12 => Some((
+                vk::Format::G8_B8R8_2PLANE_420_UNORM,
+                wgpu::TextureFormat::NV12,
+            )),
             _ => None,
         }
     }
@@ -1708,6 +1717,8 @@ impl WgpuRenderer {
             return true;
         }
 
+        self.dma_texture_cache.flush();
+
         let resources = self.resources();
         let surface_params_size = std::mem::size_of::<SurfaceParams>() as u64;
         let Some(surface_params_size) = NonZeroU64::new(surface_params_size) else {
@@ -1720,14 +1731,6 @@ impl WgpuRenderer {
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
 
         for surface in surfaces {
-            if surface.image_buffer.plane_stride <= 0 {
-                warn!(
-                    "Skipping surface with non-positive plane stride {}",
-                    surface.image_buffer.plane_stride
-                );
-                continue;
-            }
-
             let texture = match self.dma_texture_cache.get_or_create(self, surface) {
                 Some(texture) => texture,
                 None => {
@@ -1737,11 +1740,37 @@ impl WgpuRenderer {
                 }
             };
 
-            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let (surface_primary_view, surface_secondary_view, surface_source) =
+                if surface.image_buffer.format.code == DrmFourcc::Nv12 {
+                    let surface_primary_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(wgpu::TextureFormat::R8Unorm),
+                        aspect: wgpu::TextureAspect::Plane0,
+                        ..Default::default()
+                    });
+                    let surface_secondary_view =
+                        texture.create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(wgpu::TextureFormat::Rg8Unorm),
+                            aspect: wgpu::TextureAspect::Plane1,
+                            ..Default::default()
+                        });
+
+                    (
+                        surface_primary_view,
+                        surface_secondary_view,
+                        SURFACE_SOURCE_YCBCR,
+                    )
+                } else {
+                    (
+                        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                        SURFACE_SOURCE_COLOR,
+                    )
+                };
+
             let surface_params = SurfaceParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
-                metadata: [SURFACE_SOURCE_COLOR, 0, 0, 0],
+                metadata: [surface_source, 0, 0, 0],
             };
 
             resources.queue.write_buffer(
@@ -1766,11 +1795,11 @@ impl WgpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                            resource: wgpu::BindingResource::TextureView(&surface_primary_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&texture_view),
+                            resource: wgpu::BindingResource::TextureView(&surface_secondary_view),
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
@@ -2119,11 +2148,7 @@ impl WgpuRenderer {
 
     // TODO: Should be gated behind the screensharing feature
     fn get_vk_instance(&self) -> ash::Instance {
-        let device_hal = self.get_device_hal();
-
         unsafe {
-            let physical_device = device_hal.raw_physical_device();
-
             let ctx = self.context.as_ref().unwrap();
             let ctx = ctx.borrow();
             let ctx = ctx.as_ref().unwrap();

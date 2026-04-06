@@ -5,8 +5,18 @@ use crate::{
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 #[cfg(target_os = "linux")]
-use drm_fourcc::{DrmFormat, DrmFourcc};
+use drm_fourcc::DrmFormat;
+#[cfg(target_os = "linux")]
+use smallvec::SmallVec;
+
 use refineable::Refineable;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub struct DMABufferPlane {
+    pub offset: usize,
+    pub stride: usize,
+}
 
 /// Wrapper around Linux DMA Buffer with
 /// metadata attached to it
@@ -23,11 +33,26 @@ pub struct DMABuffer {
 
     /// Describes memory layout of the data
     pub format: DrmFormat,
+    /// DMA-BUF Planes
+    pub planes: SmallVec<[DMABufferPlane; 2]>,
+}
 
-    /// Currently only packed layout is supported. Plane offset
-    pub plane_offset: u32,
-    /// Currently only packed layout is supported. Plane stride
-    pub plane_stride: i32,
+impl DMABuffer {
+    pub fn new(
+        fd: i32,
+        width: u32,
+        height: u32,
+        format: DrmFormat,
+        planes: &[DMABufferPlane],
+    ) -> Self {
+        Self {
+            fd,
+            width,
+            height,
+            format,
+            planes: SmallVec::from_slice(planes),
+        }
+    }
 }
 
 /// A source of a surface's content.
