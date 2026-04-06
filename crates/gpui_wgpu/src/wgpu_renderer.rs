@@ -145,6 +145,16 @@ impl DmaTextureCache {
             return None;
         };
 
+        if wgpu_format == wgpu::TextureFormat::NV12
+            && !renderer
+                .resources()
+                .device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+        {
+            return None;
+        }
+
         let modifier: u64 = surface.image_buffer.format.modifier.into();
         let supported_modifiers = Self::get_supported_drm_modifiers(renderer, vk_format);
         if !supported_modifiers
@@ -282,6 +292,13 @@ impl DmaTextureCache {
             return None;
         }
 
+        // TODO: Make it generic somehow
+        let view_formats = if wgpu_format == wgpu::TextureFormat::NV12 {
+            vec![wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm]
+        } else {
+            Vec::new()
+        };
+
         let hal_descriptor = wgpu::hal::TextureDescriptor {
             label: Some("dma-surface"),
             size: extent,
@@ -291,7 +308,7 @@ impl DmaTextureCache {
             format: wgpu_format,
             usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
             memory_flags: wgpu::hal::MemoryFlags::empty(),
-            view_formats: Vec::new(),
+            view_formats: view_formats.clone(),
         };
 
         let hal_texture = unsafe {
@@ -311,7 +328,7 @@ impl DmaTextureCache {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            view_formats: &view_formats,
         };
 
         let resources = renderer.resources();
@@ -415,6 +432,7 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    surface_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -664,6 +682,14 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
+        let surface_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("surface_sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
         let gamma_size = std::mem::size_of::<GammaParams>() as u64;
@@ -747,7 +773,7 @@ impl WgpuRenderer {
         let last_error_clone = Arc::clone(&last_error);
         device.on_uncaptured_error(Arc::new(move |error| {
             let mut guard = last_error_clone.lock().unwrap();
-            *guard = Some(error.to_string());
+            *guard = Some(format!("{error:#}"));
         }));
 
         let resources = WgpuResources {
@@ -757,6 +783,7 @@ impl WgpuRenderer {
             pipelines,
             bind_group_layouts,
             atlas_sampler,
+            surface_sampler,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -885,7 +912,7 @@ impl WgpuRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -895,7 +922,7 @@ impl WgpuRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -904,7 +931,7 @@ impl WgpuRenderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
@@ -1717,7 +1744,7 @@ impl WgpuRenderer {
             return true;
         }
 
-        self.dma_texture_cache.flush();
+        // self.dma_texture_cache.flush();
 
         let resources = self.resources();
         let surface_params_size = std::mem::size_of::<SurfaceParams>() as u64;
@@ -1803,7 +1830,7 @@ impl WgpuRenderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                            resource: wgpu::BindingResource::Sampler(&resources.surface_sampler),
                         },
                     ],
                 });

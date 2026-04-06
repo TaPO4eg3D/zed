@@ -117,11 +117,16 @@ impl WgpuContext {
     async fn create_device(
         adapter: &wgpu::Adapter,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool)> {
-        let dual_source_blending = adapter
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let adapter_features = adapter.features();
+        let dual_source_blending = adapter_features.contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
+        if adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
+        } else {
+            log::warn!("Rendering of NV12 is not supported on this GPU");
+        }
+
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {
