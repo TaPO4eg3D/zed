@@ -127,7 +127,7 @@ impl WgpuContext {
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
-        if adapter_features.contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
+        if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_NV12) {
             required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
         } else {
             log::warn!("Rendering of NV12 is not supported on this GPU");
