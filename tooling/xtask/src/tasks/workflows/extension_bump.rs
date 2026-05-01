@@ -1,4 +1,4 @@
-use gh_workflow::{ctx::Context, *};
+use gh_workflow::*;
 use indoc::{formatdoc, indoc};
 
 use crate::tasks::workflows::{
@@ -145,7 +145,12 @@ fn create_version_label(
 }
 
 fn create_version_tag(tag: &StepOutput, generated_token: StepOutput) -> Step<Use> {
-    named::uses("actions", "github-script", "v7").with(
+    named::uses(
+        "actions",
+        "github-script",
+        "f28e40c7f34bde8b3046d885e986cb6290c5673b", // v7
+    )
+    .with(
         Input::default()
             .add(
                 "script",
@@ -322,27 +327,9 @@ fn create_pull_request(
     generated_token: StepOutput,
     branch_name: StepOutput,
 ) -> Step<Use> {
-    named::uses(
-        "peter-evans",
-        "create-pull-request",
-        "98357b18bf14b5342f975ff684046ec3b2a07725",
-    )
-    .with(
-        Input::default()
-            .add("title", title.to_string())
-            .add("body", body.to_string())
-            .add("commit-message", title.to_string())
-            .add("branch", branch_name.to_string())
-            .add(
-                "committer",
-                "zed-zippy[bot] <234243425+zed-zippy[bot]@users.noreply.github.com>",
-            )
-            .add("base", "main")
-            .add("delete-branch", true)
-            .add("token", generated_token.to_string())
-            .add("sign-commits", true)
-            .add("assignees", Context::github().actor().to_string()),
-    )
+    steps::CreatePrStep::new(title.to_string(), branch_name, &generated_token)
+        .with_body(body)
+        .into()
 }
 
 fn trigger_release(
@@ -354,7 +341,8 @@ fn trigger_release(
     let extension_registry = RepositoryTarget::new("zed-industries", &["extensions"]);
     let (generate_token, generated_token) =
         generate_token(&app_id.to_string(), &app_secret.to_string())
-            .for_repository(extension_registry);
+            .for_repository(extension_registry)
+            .into();
     let (get_extension_id, extension_id) = get_extension_id();
     let (release_action, pull_request_number) = release_action(extension_id, tag, &generated_token);
 
@@ -413,7 +401,11 @@ fn enable_automerge_if_staff(
     pull_request_number: StepOutput,
     generated_token: StepOutput,
 ) -> Step<Use> {
-    named::uses("actions", "github-script", "v7")
+    named::uses(
+        "actions",
+        "github-script",
+        "f28e40c7f34bde8b3046d885e986cb6290c5673b", // v7
+    )
         .add_with(("github-token", generated_token.to_string()))
         .add_with((
             "script",
