@@ -124,15 +124,15 @@ impl DmaTextureCache {
         surface: &PaintSurface,
     ) -> Option<wgpu::Texture> {
         // Check if we already mapped this DMA-BUF to wgpu::Texture
-        let fd = surface.image_buffer.fd;
+        // let fd = surface.image_buffer.fd;
 
-        {
-            let textures = self.textures.borrow();
+        // {
+        //     let textures = self.textures.borrow();
 
-            if let Some((_, texture)) = textures.iter().find(|(cfd, _)| *cfd == fd) {
-                return Some(texture.clone());
-            }
-        }
+        //     if let Some((_, texture)) = textures.iter().find(|(cfd, _)| *cfd == fd) {
+        //         return Some(texture.clone());
+        //     }
+        // }
 
         let Some((vk_format, wgpu_format)) =
             Self::surface_texture_formats(surface.image_buffer.format.code)
@@ -338,8 +338,8 @@ impl DmaTextureCache {
                 .create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &descriptor)
         };
 
-        let mut textures = self.textures.borrow_mut();
-        textures.push((fd, texture.clone()));
+        // let mut textures = self.textures.borrow_mut();
+        // textures.push((fd, texture.clone()));
 
         Some(texture)
     }
