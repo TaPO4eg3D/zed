@@ -37,6 +37,7 @@ pub struct DMABuffer {
     pub planes: SmallVec<[DMABufferPlane; 2]>,
 }
 
+#[cfg(target_os = "linux")]
 impl DMABuffer {
     pub fn new(
         fd: i32,
